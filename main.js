@@ -192,21 +192,19 @@ export default class Agent extends Plugin {
     return [
       this.renderStatus(session),
       ui.composer([
-        session.context
-          ? ui.chip(session.context.label, () => {
-              session.context = null;
-              this.panel.refresh();
-            })
-          : null,
+        this.renderAttachments(session),
+        this.renderMention(session),
         ui.textArea(session.draft, (draft) => {
+          const before = mentionQuery(session.draft);
           session.draft = draft;
+          if (before !== mentionQuery(draft)) this.panel.refresh();
         }, {
           id: "composer",
           rows: 1,
           maxRows: 7,
           plain: true,
-          placeholder: "Ask anything",
-          onSubmit: (text) => this.submit(text),
+          placeholder: "Ask anything, @ to add a note",
+          onSubmit: (text) => this.commitDraft(session, text),
         }),
         ui.row(
           [
@@ -218,7 +216,7 @@ export default class Agent extends Plugin {
                   variant: "ghost",
                   tooltip: "Add the selection",
                 }),
-                ui.button("", () => this.submit(session.draft), {
+                ui.button("", () => this.commitDraft(session), {
                   icon: "arrow-up",
                   variant: "primary",
                   tooltip: "Send",
@@ -237,6 +235,7 @@ export default class Agent extends Plugin {
     if (message.role === "user") {
       const blocks = [ui.text("You", { small: true, muted: true, bold: true })];
       if (message.attachment) blocks.push(ui.chip(message.attachment.label));
+      for (const note of message.notes || []) blocks.push(ui.chip(note.label));
       if (message.text) blocks.push(ui.markdown(quote(message.text)));
       return blocks;
     }
@@ -269,7 +268,7 @@ export default class Agent extends Plugin {
 
   newChat() {
     const current = this.chat();
-    if (current && !current.messages.length && !current.draft && !current.context) {
+    if (current && !current.messages.length && !current.draft && !current.context && !current.notes?.length) {
       current.open = true;
       this.activeId = current.id;
       this.historyOpen = false;
@@ -297,7 +296,7 @@ export default class Agent extends Plugin {
   closeSession(id) {
     const session = this.sessions.find((item) => item.id === id);
     if (!session) return;
-    const empty = !session.messages.length && !session.draft && !session.context;
+    const empty = !session.messages.length && !session.draft && !session.context && !session.notes?.length;
     if (empty) this.sessions = this.sessions.filter((item) => item.id !== id);
     else session.open = false;
     if (this.activeId === id) {
@@ -352,6 +351,101 @@ export default class Agent extends Plugin {
     return true;
   }
 
+  renderAttachments(session) {
+    const chips = [];
+    if (session.context) {
+      chips.push(
+        ui.chip(session.context.label, () => {
+          session.context = null;
+          this.panel.refresh();
+        }),
+      );
+    }
+    for (const note of session.notes || []) {
+      chips.push(
+        ui.chip(note.label, () => {
+          session.notes = session.notes.filter((item) => item.path !== note.path);
+          this.persistSessions();
+          this.panel.refresh();
+        }),
+      );
+    }
+    return chips.length ? ui.row(chips, { wrap: true }) : null;
+  }
+
+  /** Notes matching the `@` being typed at the end of the draft. */
+  renderMention(session) {
+    const query = mentionQuery(session.draft);
+    if (query === null) return null;
+    const notes = this.mentionNotes(query);
+    if (!notes.length) return ui.text("No notes match.", { small: true, muted: true });
+    return ui.list(
+      notes.map((note) => ({
+        title: note.name,
+        subtitle: note.path,
+        icon: "file-text",
+        onClick: () => this.attachNote(note.path),
+      })),
+      { compact: true },
+    );
+  }
+
+  mentionNotes(query) {
+    const q = String(query || "").trim().toLowerCase();
+    return this.app.vault
+      .getNotes()
+      .map((note) => ({ note, score: noteScore(note, q) }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.note.path.localeCompare(b.note.path))
+      .slice(0, 8)
+      .map((item) => item.note);
+  }
+
+  /** Enter or Send attaches the highlighted note while `@` is being typed. */
+  commitDraft(session, text) {
+    const draft = text ?? session.draft;
+    const query = mentionQuery(draft);
+    if (query !== null) {
+      const [match] = this.mentionNotes(query);
+      if (match) {
+        session.draft = draft;
+        this.attachNote(match.path);
+        return;
+      }
+    }
+    this.submit(draft);
+  }
+
+  /** Adds a whole note to the chat, shown as its file name. */
+  attachNote(path) {
+    const session = this.chat();
+    const notes = session.notes || [];
+    session.draft = String(session.draft || "").replace(/(^|\s)@[^\n]*$/, "$1");
+    if (notes.some((item) => item.path === path)) {
+      session.notes = notes;
+      this.panel.refresh();
+      return;
+    }
+    if (notes.length >= 5) {
+      new Notice("This chat already has 5 notes.");
+      this.panel.refresh();
+      return;
+    }
+    let text = "";
+    try {
+      const active = this.app.workspace.getActiveNote();
+      text = active && active.path === path ? active.text : this.app.vault.read(path);
+    } catch (error) {
+      new Notice(error.message || "Could not read that note.");
+      this.panel.refresh();
+      return;
+    }
+    notes.push({ path, label: String(path).split("/").pop(), text: clipNote(text) });
+    session.notes = notes;
+    this.persistSessions();
+    this.panel.refresh();
+  }
+
   stop() {
     this.generation += 1;
     this.signal.stopped = true;
@@ -377,19 +471,21 @@ export default class Agent extends Plugin {
     const session = this.chat();
     const question = String(text ?? "").trim();
     const attachment = session.context;
-    if (!question && !attachment) return;
+    const notes = session.notes || [];
+    if (!question && !attachment && !notes.length) return;
     if (this.workingId) {
       if (this.workingId !== session.id) new Notice("The other chat is still replying.");
       return;
     }
     const problem = chatError(this.settings);
     if (!session.messages.some((message) => message.role === "user")) {
-      session.title = chatTitle(question, attachment);
+      session.title = chatTitle(question, attachment, notes);
     }
     session.draft = "";
     session.context = null;
+    session.notes = [];
     session.updated = Date.now();
-    session.messages.push({ role: "user", text: question, attachment });
+    session.messages.push({ role: "user", text: question, attachment, notes });
     session.result = null;
     this.historyOpen = false;
     this.persistSessions();
@@ -423,6 +519,7 @@ export default class Agent extends Plugin {
         history,
         question,
         attachment,
+        notes,
         read: (name) => this.readFile(name),
         signal,
         onUpdate: (update) => {
@@ -702,6 +799,7 @@ function blankSession() {
     messages: [],
     draft: "",
     context: null,
+    notes: [],
     open: true,
     updated: Date.now(),
   };
@@ -726,6 +824,15 @@ function sanitizeSession(session) {
     messages: Array.isArray(session.messages) ? session.messages : [],
     draft: String(session.draft || ""),
     context: session.context && session.context.text ? session.context : null,
+    notes: Array.isArray(session.notes)
+      ? session.notes
+          .filter((note) => note && note.path && note.text)
+          .map((note) => ({
+            path: String(note.path),
+            label: String(note.label || note.path).split("/").pop(),
+            text: String(note.text),
+          }))
+      : [],
     result:
       session.result && Number.isFinite(Number(session.result.ms))
         ? { ms: Number(session.result.ms), tokens: Number(session.result.tokens) || 0 }
@@ -746,8 +853,32 @@ function trimSessions(sessions) {
   return sessions.filter((session) => kept.has(session.id));
 }
 
-function chatTitle(text, attachment) {
-  const line = String(text || attachment?.label || "New chat").trim().split("\n")[0];
+function mentionQuery(draft) {
+  const match = String(draft || "").match(/(?:^|\s)@([^\n]*)$/);
+  return match ? match[1] : null;
+}
+
+function noteScore(note, query) {
+  if (!query) return note.modified || 1;
+  const name = String(note.name || "").toLowerCase();
+  const path = String(note.path || "").toLowerCase();
+  if (name === query || path === query) return 100;
+  if (name.startsWith(query)) return 80;
+  const parts = query.split(/\s+/).filter(Boolean);
+  if (parts.length > 1 && parts.every((part) => name.includes(part) || path.includes(part))) return 70;
+  if (name.includes(query) || path.startsWith(query)) return 60;
+  if (path.includes(query)) return 40;
+  return 0;
+}
+
+function clipNote(text) {
+  const value = String(text || "");
+  if (value.length <= 12000) return value;
+  return `${value.slice(0, 12000)}\n\n[The rest of the note was left out.]`;
+}
+
+function chatTitle(text, attachment, notes) {
+  const line = String(text || attachment?.label || notes?.[0]?.label || "New chat").trim().split("\n")[0];
   if (!line) return "New chat";
   return line.length > 48 ? `${line.slice(0, 48)}…` : line;
 }

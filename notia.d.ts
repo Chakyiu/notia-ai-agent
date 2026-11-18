@@ -227,8 +227,10 @@ declare module "notia" {
   /** The building blocks of panels. */
   export const ui: {
     column(children: Child[], options?: object): Element;
-    /** `wrap: false` keeps children on one line. */
-    row(children: Child[], options?: { wrap?: boolean }): Element;
+    /** `wrap: false` keeps children on one line. `spread` puts the first and last at opposite ends. */
+    row(children: Child[], options?: { wrap?: boolean; spread?: boolean }): Element;
+    /** A bordered field. A chat puts the question and its controls in one. */
+    composer(children: Child[]): Element;
     /** A small section heading, like those of the core panels. */
     heading(text: string): Element;
     text(
@@ -247,6 +249,11 @@ declare module "notia" {
       },
     ): Element;
     list(items: (ListItem | string)[]): Element;
+    /**
+     * A short label, such as a passage added to the chat. `onClose` draws
+     * an × that removes it.
+     */
+    chip(label: string, onClose?: () => unknown): Element;
     separator(): Element;
     /** A centered, muted message for when there is nothing to show. */
     empty(text: string): Element;
@@ -262,11 +269,12 @@ declare module "notia" {
     /**
      * A text field. `onChange` runs as the text changes. In a panel, the field
      * keeps what the user types until `render` passes a different value.
+     * `secret` hides the text until the field's button shows it.
      */
     textInput(
       value: string,
       onChange: (value: string) => unknown,
-      options?: { placeholder?: string },
+      options?: { placeholder?: string; secret?: boolean },
     ): Element;
     /**
      * A multi-line text field. `onChange` runs as the text changes.
@@ -282,6 +290,8 @@ declare module "notia" {
         id?: string;
         rows?: number;
         placeholder?: string;
+        /** Leaves out the field's own border, for use inside `composer`. */
+        plain?: boolean;
         onSubmit?: (value: string) => unknown;
       },
     ): Element;

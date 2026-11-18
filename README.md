@@ -2,7 +2,7 @@
 
 A chat agent for [Notia](https://github.com/Chakyiu/notia), in the sidebar beside the note you have open. Ask it about the vault, and it can read notes, search them, create a note, and edit one. It does not run commands or delete notes.
 
-The sparkles button above a note opens the panel. `⌘⇧A` does the same (Ctrl+Shift+A on Windows and Linux). **Ask the agent about the selection** sends the selected text.
+The sparkles button above a note opens the panel. `⌘⇧A` does the same (Ctrl+Shift+A on Windows and Linux). **Ask the agent about the selection** adds the selected lines to the chat, shown as the file and the line numbers.
 
 ## Install
 

@@ -22,6 +22,7 @@ export default class Agent extends Plugin {
     this.settings = { ...defaults(), ...(saved && typeof saved === "object" ? saved : {}) };
     this.messages = [];
     this.draft = "";
+    this.context = null;
     this.working = null;
     this.pendingActions = [];
     this.generation = 0;
@@ -75,13 +76,8 @@ export default class Agent extends Plugin {
       name: "Ask the agent about the selection",
       icon: "sparkles",
       editorCallback: (editor, note) => {
-        if (!note) return;
-        const selected = editor.getSelection().trim();
-        const question = selected
-          ? `Look at this passage from ${note.path} and help me with it:\n\n${selected}`
-          : `Help me with ${note.path}.`;
+        if (!this.attachSelection(editor, note)) return;
         this.panel.show();
-        this.submit(question);
       },
     });
     this.addCommand({
@@ -105,29 +101,67 @@ export default class Agent extends Plugin {
       if (this.pendingActions.length) messages.push(ui.list(this.actionItems(this.pendingActions)));
     }
     const chat = chatEndpoint(this.settings);
-    const label = chat.model ? `${chat.provider.label} · ${chat.model}` : chat.provider.label;
-    return ui.dock(messages, [
-      ui.text(label, { small: true, muted: true }),
-      ui.textArea(this.draft, (draft) => {
-        this.draft = draft;
-      }, {
-        id: "composer",
-        rows: 3,
-        placeholder: "Ask anything",
-        onSubmit: (text) => this.submit(text),
-      }),
-      ui.row([
-        this.working
-          ? ui.button("Stop", () => this.stop(), { icon: "circle-stop", variant: "outline" })
-          : ui.button("Send", () => this.submit(this.draft), { icon: "arrow-up", variant: "primary" }),
-        ui.button("New", () => this.newChat(), { icon: "plus", variant: "ghost", tooltip: "New chat" }),
+    const model = chat.model || chat.provider.label;
+    return ui.dock(
+      messages,
+      ui.composer([
+        this.context
+          ? ui.chip(this.context.label, () => {
+              this.context = null;
+              this.panel.refresh();
+            })
+          : null,
+        ui.textArea(this.draft, (draft) => {
+          this.draft = draft;
+        }, {
+          id: "composer",
+          rows: 2,
+          plain: true,
+          placeholder: "Ask anything",
+          onSubmit: (text) => this.submit(text),
+        }),
+        ui.row(
+          [
+            ui.text(model, { small: true, muted: true }),
+            ui.row(
+              [
+                ui.button("", () => this.attachSelection(), {
+                  icon: "paperclip",
+                  variant: "ghost",
+                  tooltip: "Add the selection",
+                }),
+                ui.button("", () => this.newChat(), {
+                  icon: "plus",
+                  variant: "ghost",
+                  tooltip: "New chat",
+                }),
+                this.working
+                  ? ui.button("", () => this.stop(), {
+                      icon: "circle-stop",
+                      variant: "ghost",
+                      tooltip: "Stop",
+                    })
+                  : ui.button("", () => this.submit(this.draft), {
+                      icon: "arrow-up",
+                      variant: "primary",
+                      tooltip: "Send",
+                    }),
+              ],
+              { wrap: false },
+            ),
+          ],
+          { spread: true, wrap: false },
+        ),
       ]),
-    ]);
+    );
   }
 
   renderMessage(message) {
     if (message.role === "user") {
-      return [ui.text("You", { small: true, muted: true, bold: true }), ui.markdown(quote(message.text))];
+      const blocks = [ui.text("You", { small: true, muted: true, bold: true })];
+      if (message.attachment) blocks.push(ui.chip(message.attachment.label));
+      if (message.text) blocks.push(ui.markdown(quote(message.text)));
+      return blocks;
     }
     const blocks = [ui.text("Agent", { small: true, muted: true, bold: true })];
     if (message.error) blocks.push(ui.text(message.text, { danger: true }));
@@ -151,9 +185,35 @@ export default class Agent extends Plugin {
     this.signal.stopped = true;
     this.messages = [];
     this.draft = "";
+    this.context = null;
     this.working = null;
     this.pendingActions = [];
     this.panel.refresh();
+  }
+
+  /** Adds the selected lines to the chat, shown as the file and the line numbers. */
+  attachSelection(editor, note) {
+    const open = note || this.app.workspace.getActiveNote();
+    const writing = editor || this.app.workspace.getActiveEditor();
+    const selected = writing?.somethingSelected?.() ? writing.getSelection().trim() : "";
+    if (!writing || !open || !selected) {
+      new Notice("Select some text in a note first.");
+      return false;
+    }
+    const from = writing.getCursor("from");
+    const to = writing.getCursor("to");
+    let end = to.line;
+    if (to.ch === 0 && end > from.line) end -= 1;
+    const file = String(open.path).split("/").pop();
+    const start = from.line + 1;
+    const last = end + 1;
+    this.context = {
+      path: open.path,
+      label: start === last ? `${file} (${start})` : `${file} (${start}-${last})`,
+      text: selected,
+    };
+    this.panel.refresh();
+    return true;
   }
 
   stop() {
@@ -168,10 +228,12 @@ export default class Agent extends Plugin {
 
   async submit(text) {
     const question = String(text ?? "").trim();
-    if (!question || this.working) return;
+    const attachment = this.context;
+    if ((!question && !attachment) || this.working) return;
     const problem = chatError(this.settings);
     this.draft = "";
-    this.messages.push({ role: "user", text: question });
+    this.context = null;
+    this.messages.push({ role: "user", text: question, attachment });
     if (problem) {
       this.messages.push({ role: "assistant", text: `${problem} Settings → AI agent.`, error: true });
       this.panel.refresh();
@@ -191,6 +253,7 @@ export default class Agent extends Plugin {
         settings: this.settings,
         history,
         question,
+        attachment,
         read: (name) => this.readFile(name),
         signal,
         onUpdate: (update) => {
@@ -246,9 +309,13 @@ export default class Agent extends Plugin {
         }),
         { description: chat.provider.base ? `Default address: ${chat.provider.base}` : "Set the server address below." },
       ),
-      ui.setting("API key", ui.textInput(this.settings.chatKey, (chatKey) => this.save({ chatKey })), {
-        description: "Saved in this plugin's folder on this computer. It is not synced.",
-      }),
+      ui.setting(
+        "API key",
+        ui.textInput(this.settings.chatKey, (chatKey) => this.save({ chatKey }), { secret: true }),
+        {
+          description: "Hidden until you show it. Saved in this plugin's folder on this computer. It is not synced.",
+        },
+      ),
       ui.setting("Server address", ui.textInput(this.settings.chatBase, (chatBase) => this.save({ chatBase })), {
         description: "Leave empty to use the provider's own address.",
       }),
@@ -302,9 +369,11 @@ export default class Agent extends Plugin {
     );
     if (this.settings.embeddingProvider !== "same" && this.settings.embeddingProvider !== "none") {
       rows.push(
-        ui.setting("Embedding API key", ui.textInput(this.settings.embeddingKey, (embeddingKey) => this.save({ embeddingKey })), {
-          description: "Leave empty to use the chat key.",
-        }),
+        ui.setting(
+          "Embedding API key",
+          ui.textInput(this.settings.embeddingKey, (embeddingKey) => this.save({ embeddingKey }), { secret: true }),
+          { description: "Hidden until you show it. Leave empty to use the chat key." },
+        ),
         ui.setting(
           "Embedding server",
           ui.textInput(this.settings.embeddingBase, (embeddingBase) => this.save({ embeddingBase })),

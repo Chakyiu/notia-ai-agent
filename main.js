@@ -382,7 +382,6 @@ export default class Agent extends Plugin {
     return ui.list(
       notes.map((note) => ({
         title: note.name,
-        subtitle: note.path,
         icon: "file-text",
         onClick: () => this.attachNote(note.path),
       })),

@@ -197,13 +197,24 @@ export default class Agent extends Plugin {
         ui.textArea(session.draft, (draft) => {
           const before = mentionQuery(session.draft);
           session.draft = draft;
+          const closed = String(draft).match(/\[\[([^\]\n]+)\]\]$/);
+          if (closed) {
+            const wanted = closed[1].trim().toLowerCase();
+            const match = this.mentionNotes(closed[1]).find(
+              (note) => note.name.toLowerCase() === wanted || String(note.path).toLowerCase() === wanted,
+            );
+            if (match) {
+              this.attachNote(match.path);
+              return;
+            }
+          }
           if (before !== mentionQuery(draft)) this.panel.refresh();
         }, {
           id: "composer",
           rows: 1,
           maxRows: 7,
           plain: true,
-          placeholder: "Ask anything, @ to add a note",
+          placeholder: "Ask anything, [[ to add a note",
           onSubmit: (text) => this.commitDraft(session, text),
         }),
         ui.row(
@@ -373,7 +384,7 @@ export default class Agent extends Plugin {
     return chips.length ? ui.row(chips, { wrap: true }) : null;
   }
 
-  /** Notes matching the `@` being typed at the end of the draft. */
+  /** Notes matching the `[[` link being typed at the end of the draft. */
   renderMention(session) {
     const query = mentionQuery(session.draft);
     if (query === null) return null;
@@ -400,7 +411,7 @@ export default class Agent extends Plugin {
       .map((item) => item.note);
   }
 
-  /** Enter or Send attaches the highlighted note while `@` is being typed. */
+  /** Enter or Send attaches the highlighted note while `[[` is being typed. */
   commitDraft(session, text) {
     const draft = text ?? session.draft;
     const query = mentionQuery(draft);
@@ -419,7 +430,7 @@ export default class Agent extends Plugin {
   attachNote(path) {
     const session = this.chat();
     const notes = session.notes || [];
-    session.draft = String(session.draft || "").replace(/(^|\s)@[^\n]*$/, "$1");
+    session.draft = String(session.draft || "").replace(/\[\[[^\]\n]*(?:\]\])?$/, "");
     if (notes.some((item) => item.path === path)) {
       session.notes = notes;
       this.panel.refresh();
@@ -853,7 +864,7 @@ function trimSessions(sessions) {
 }
 
 function mentionQuery(draft) {
-  const match = String(draft || "").match(/(?:^|\s)@([^\n]*)$/);
+  const match = String(draft || "").match(/\[\[([^\]\n]*)$/);
   return match ? match[1] : null;
 }
 

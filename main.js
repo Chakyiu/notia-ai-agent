@@ -111,7 +111,7 @@ export default class Agent extends Plugin {
       .filter((session) => session.open)
       .map((session) => ({
         label: session.title,
-        icon: "sparkles",
+        icon: "message-square",
         active: session.id === this.activeId,
         onSelect: () => this.selectSession(session.id),
         onClose: () => this.closeSession(session.id),

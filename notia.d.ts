@@ -139,6 +139,11 @@ declare module "notia" {
     body?: string;
     /** Milliseconds. The default is 120 seconds, and the longest is 180. */
     timeout?: number;
+    /**
+     * Called with each piece of a successful body as it arrives. The promise
+     * still resolves with the whole reply.
+     */
+    onChunk?: (text: string) => void;
   }
 
   /** A finished HTTP reply. A status such as 404 still resolves. */
@@ -237,6 +242,8 @@ declare module "notia" {
       text: string,
       options?: { muted?: boolean; bold?: boolean; small?: boolean; danger?: boolean },
     ): Element;
+    /** A Lucide icon, with no button around it. */
+    icon(name: string, options?: { muted?: boolean }): Element;
     markdown(source: string): Element;
     button(
       label: string,
@@ -248,7 +255,8 @@ declare module "notia" {
         tooltip?: string;
       },
     ): Element;
-    list(items: (ListItem | string)[]): Element;
+    /** `compact` draws shorter rows, for a log of tool calls. */
+    list(items: (ListItem | string)[], options?: { compact?: boolean }): Element;
     /**
      * A short label, such as a passage added to the chat. `onClose` draws
      * an × that removes it.
@@ -288,7 +296,10 @@ declare module "notia" {
       onChange: (value: string) => unknown,
       options?: {
         id?: string;
+        /** How tall the field is. With `maxRows`, this is the shortest it gets. */
         rows?: number;
+        /** Grow with the text up to this many lines, then scroll. */
+        maxRows?: number;
         placeholder?: string;
         /** Leaves out the field's own border, for use inside `composer`. */
         plain?: boolean;
@@ -302,11 +313,26 @@ declare module "notia" {
       options?: { min?: number; max?: number; step?: number },
     ): Element;
     /**
+     * A bar of chats. A tab shows `label`, selects on click, and closes when
+     * `onClose` is set. `actions` sit at the end of the bar.
+     */
+    tabBar(
+      tabs: {
+        label: string;
+        icon?: string;
+        active?: boolean;
+        onSelect?: () => unknown;
+        onClose?: () => unknown;
+      }[],
+      actions?: Child[],
+    ): Element;
+    /**
      * A scrolling body with a footer that stays at the bottom of a sidebar
      * panel. `body` and `footer` are elements or arrays of them. A chat uses
-     * it so the messages scroll and the field stays put.
+     * it so the messages scroll and the field stays put. `header` stays
+     * above the list.
      */
-    dock(body: Child | Child[], footer: Child | Child[]): Element;
+    dock(body: Child | Child[], footer: Child | Child[], header?: Child | Child[]): Element;
     /** A menu of options: values, `[value, label]` pairs, or `{ value, label }`. */
     dropdown(
       value: string,

@@ -1,7 +1,7 @@
 {
   "id": "ai-agent",
   "name": "AI agent",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "chakyiu",
   "description": "A chat agent beside your notes. Choose the provider, chat model, and embedding model.",
   "main": "main.js"

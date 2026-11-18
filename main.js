@@ -20,10 +20,15 @@ export default class Agent extends Plugin {
   async onload() {
     const saved = await this.loadData();
     this.settings = { ...defaults(), ...(saved && typeof saved === "object" ? saved : {}) };
-    this.messages = [];
-    this.draft = "";
-    this.context = null;
+    const stored = loadSessions(this.readFile("sessions.json"));
+    this.sessions = stored.sessions.length ? stored.sessions : [blankSession()];
+    if (!this.sessions.some((session) => session.open)) this.sessions.push(blankSession());
+    const open = this.sessions.find((session) => session.id === stored.activeId && session.open);
+    this.activeId = (open || this.sessions.find((session) => session.open)).id;
+    this.historyOpen = false;
     this.working = null;
+    this.workingId = null;
+    this.streamText = "";
     this.pendingActions = [];
     this.generation = 0;
     this.signal = { stopped: false };
@@ -55,6 +60,9 @@ export default class Agent extends Plugin {
     });
 
     this.addRibbonIcon("bot", "Agent", () => this.panel.show());
+    setInterval(() => {
+      if (this.workingId) this.panel.refresh();
+    }, 1000);
     this.addCommand({
       id: "show",
       name: "Show the agent",
@@ -93,29 +101,109 @@ export default class Agent extends Plugin {
   }
 
   renderChat() {
-    const messages = this.messages.length
-      ? flatten(this.messages.map((message) => this.renderMessage(message)))
+    const session = this.chat();
+    const body = this.historyOpen ? this.renderHistory() : this.renderMessages(session);
+    return ui.dock(body, this.renderComposer(session), this.renderTabBar());
+  }
+
+  renderTabBar() {
+    const tabs = this.sessions
+      .filter((session) => session.open)
+      .map((session) => ({
+        label: session.title,
+        icon: "sparkles",
+        active: session.id === this.activeId,
+        onSelect: () => this.selectSession(session.id),
+        onClose: () => this.closeSession(session.id),
+      }));
+    return ui.tabBar(tabs, [
+      ui.button("", () => this.newChat(), { icon: "plus", variant: "ghost", tooltip: "New chat" }),
+      ui.button("", () => this.toggleHistory(), {
+        icon: "clock",
+        variant: "ghost",
+        tooltip: this.historyOpen ? "Close history" : "History",
+      }),
+    ]);
+  }
+
+  renderHistory() {
+    const items = this.sessions
+      .filter((session) => session.messages.length)
+      .sort((a, b) => a.updated - b.updated);
+    if (!items.length) return [ui.empty("No earlier chats.")];
+    return [
+      ui.heading("History"),
+      ui.list(
+        items.map((session) => ({
+          title: session.title,
+          subtitle: sessionStamp(session.updated),
+          icon: session.id === this.activeId ? "sparkles" : "message-square",
+          onClick: () => this.selectSession(session.id),
+        })),
+      ),
+    ];
+  }
+
+  renderMessages(session) {
+    const messages = session.messages.length
+      ? flatten(session.messages.map((message) => this.renderMessage(message)))
       : [ui.empty("Ask anything about your notes.")];
-    if (this.working) {
-      messages.push(ui.text(this.working, { small: true, muted: true }));
-      if (this.pendingActions.length) messages.push(ui.list(this.actionItems(this.pendingActions)));
+    if (this.workingId === session.id) {
+      if (this.streamText) {
+        messages.push(ui.text("Agent", { small: true, muted: true, bold: true }));
+        messages.push(ui.markdown(this.streamText));
+      }
+      if (this.pendingActions.length) {
+        messages.push(ui.list(this.actionItems(this.pendingActions), { compact: true }));
+      }
     }
+    return messages;
+  }
+
+  renderStatus(session) {
+    const live = this.workingId === session.id;
+    const done = !live && session.result;
+    if (!live && !done) return null;
+    const ms = live ? Date.now() - (this.started || Date.now()) : session.result.ms;
+    const seconds = Math.max(1, Math.round(ms / 1000));
+    const parts = [
+      ui.icon(live ? "circle" : "check", { muted: live }),
+      ui.text(live ? "Working" : "Done", { small: true }),
+      ui.text(`${seconds}s`, { small: true, muted: true }),
+    ];
+    if (done && session.result.tokens > 0 && ms > 0) {
+      const rate = Math.max(1, Math.round(session.result.tokens / (ms / 1000)));
+      parts.push(ui.text(`${rate} tok/s`, { small: true, muted: true }));
+    }
+    return ui.row(
+      [
+        ui.row(parts, { wrap: false }),
+        live
+          ? ui.button("", () => this.stop(), { icon: "square", variant: "ghost", tooltip: "Stop" })
+          : null,
+      ],
+      { spread: true, wrap: false },
+    );
+  }
+
+  renderComposer(session) {
     const chat = chatEndpoint(this.settings);
     const model = chat.model || chat.provider.label;
-    return ui.dock(
-      messages,
+    return [
+      this.renderStatus(session),
       ui.composer([
-        this.context
-          ? ui.chip(this.context.label, () => {
-              this.context = null;
+        session.context
+          ? ui.chip(session.context.label, () => {
+              session.context = null;
               this.panel.refresh();
             })
           : null,
-        ui.textArea(this.draft, (draft) => {
-          this.draft = draft;
+        ui.textArea(session.draft, (draft) => {
+          session.draft = draft;
         }, {
           id: "composer",
-          rows: 2,
+          rows: 1,
+          maxRows: 7,
           plain: true,
           placeholder: "Ask anything",
           onSubmit: (text) => this.submit(text),
@@ -130,22 +218,11 @@ export default class Agent extends Plugin {
                   variant: "ghost",
                   tooltip: "Add the selection",
                 }),
-                ui.button("", () => this.newChat(), {
-                  icon: "plus",
-                  variant: "ghost",
-                  tooltip: "New chat",
+                ui.button("", () => this.submit(session.draft), {
+                  icon: "arrow-up",
+                  variant: "primary",
+                  tooltip: "Send",
                 }),
-                this.working
-                  ? ui.button("", () => this.stop(), {
-                      icon: "circle-stop",
-                      variant: "ghost",
-                      tooltip: "Stop",
-                    })
-                  : ui.button("", () => this.submit(this.draft), {
-                      icon: "arrow-up",
-                      variant: "primary",
-                      tooltip: "Send",
-                    }),
               ],
               { wrap: false },
             ),
@@ -153,7 +230,7 @@ export default class Agent extends Plugin {
           { spread: true, wrap: false },
         ),
       ]),
-    );
+    ];
   }
 
   renderMessage(message) {
@@ -166,7 +243,9 @@ export default class Agent extends Plugin {
     const blocks = [ui.text("Agent", { small: true, muted: true, bold: true })];
     if (message.error) blocks.push(ui.text(message.text, { danger: true }));
     else if (message.text) blocks.push(ui.markdown(message.text));
-    if (message.actions?.length) blocks.push(ui.list(this.actionItems(message.actions)));
+    if (message.actions?.length) {
+      blocks.push(ui.list(this.actionItems(message.actions), { compact: true }));
+    }
     if (message.ms) blocks.push(ui.text(worked(message), { small: true, muted: true }));
     return blocks;
   }
@@ -180,15 +259,72 @@ export default class Agent extends Plugin {
     }));
   }
 
+  chat() {
+    return (
+      this.sessions.find((session) => session.id === this.activeId) ||
+      this.sessions.find((session) => session.open) ||
+      this.sessions[0]
+    );
+  }
+
   newChat() {
-    this.generation += 1;
-    this.signal.stopped = true;
-    this.messages = [];
-    this.draft = "";
-    this.context = null;
-    this.working = null;
-    this.pendingActions = [];
+    const current = this.chat();
+    if (current && !current.messages.length && !current.draft && !current.context) {
+      current.open = true;
+      this.activeId = current.id;
+      this.historyOpen = false;
+      this.panel.refresh();
+      return;
+    }
+    const session = blankSession();
+    this.sessions.push(session);
+    this.activeId = session.id;
+    this.historyOpen = false;
+    this.persistSessions();
     this.panel.refresh();
+  }
+
+  selectSession(id) {
+    const session = this.sessions.find((item) => item.id === id);
+    if (!session) return;
+    session.open = true;
+    this.activeId = id;
+    this.historyOpen = false;
+    this.persistSessions();
+    this.panel.refresh();
+  }
+
+  closeSession(id) {
+    const session = this.sessions.find((item) => item.id === id);
+    if (!session) return;
+    const empty = !session.messages.length && !session.draft && !session.context;
+    if (empty) this.sessions = this.sessions.filter((item) => item.id !== id);
+    else session.open = false;
+    if (this.activeId === id) {
+      const open = this.sessions.filter((item) => item.open);
+      if (!open.length) {
+        const fresh = blankSession();
+        this.sessions.push(fresh);
+        this.activeId = fresh.id;
+      } else {
+        this.activeId = open[open.length - 1].id;
+      }
+    }
+    this.persistSessions();
+    this.panel.refresh();
+  }
+
+  toggleHistory() {
+    this.historyOpen = !this.historyOpen;
+    this.panel.refresh();
+  }
+
+  persistSessions() {
+    this.sessions = trimSessions(this.sessions);
+    this.writeFile(
+      "sessions.json",
+      JSON.stringify({ activeId: this.activeId, sessions: this.sessions }),
+    );
   }
 
   /** Adds the selected lines to the chat, shown as the file and the line numbers. */
@@ -207,7 +343,7 @@ export default class Agent extends Plugin {
     const file = String(open.path).split("/").pop();
     const start = from.line + 1;
     const last = end + 1;
-    this.context = {
+    this.chat().context = {
       path: open.path,
       label: start === last ? `${file} (${start})` : `${file} (${start}-${last})`,
       text: selected,
@@ -220,33 +356,66 @@ export default class Agent extends Plugin {
     this.generation += 1;
     this.signal.stopped = true;
     const actions = this.pendingActions;
+    const session = this.sessions.find((item) => item.id === this.workingId) || this.chat();
     this.pendingActions = [];
+    const partial = this.streamText;
+    this.streamText = "";
     this.working = null;
-    this.messages.push({ role: "assistant", text: "Stopped.", actions, ms: Date.now() - (this.started || Date.now()) });
+    this.workingId = null;
+    session.messages.push({
+      role: "assistant",
+      text: partial ? `${partial}\n\nStopped.` : "Stopped.",
+      actions,
+      ms: Date.now() - (this.started || Date.now()),
+    });
+    session.updated = Date.now();
+    this.persistSessions();
     this.panel.refresh();
   }
 
   async submit(text) {
+    const session = this.chat();
     const question = String(text ?? "").trim();
-    const attachment = this.context;
-    if ((!question && !attachment) || this.working) return;
+    const attachment = session.context;
+    if (!question && !attachment) return;
+    if (this.workingId) {
+      if (this.workingId !== session.id) new Notice("The other chat is still replying.");
+      return;
+    }
     const problem = chatError(this.settings);
-    this.draft = "";
-    this.context = null;
-    this.messages.push({ role: "user", text: question, attachment });
+    if (!session.messages.some((message) => message.role === "user")) {
+      session.title = chatTitle(question, attachment);
+    }
+    session.draft = "";
+    session.context = null;
+    session.updated = Date.now();
+    session.messages.push({ role: "user", text: question, attachment });
+    session.result = null;
+    this.historyOpen = false;
+    this.persistSessions();
     if (problem) {
-      this.messages.push({ role: "assistant", text: `${problem} Settings → AI agent.`, error: true });
+      session.messages.push({ role: "assistant", text: `${problem} Settings → AI agent.`, error: true });
       this.panel.refresh();
       return;
     }
+    const sessionId = session.id;
     const generation = ++this.generation;
     this.signal = { stopped: false };
     const signal = this.signal;
     this.working = "Thinking…";
+    this.workingId = sessionId;
+    this.streamText = "";
     this.pendingActions = [];
     this.started = Date.now();
     this.panel.refresh();
-    const history = this.messages.slice(0, -1);
+    const history = session.messages.slice(0, -1);
+    const finish = (message) => {
+      const target = this.sessions.find((item) => item.id === sessionId);
+      if (!target) return;
+      target.messages.push(message);
+      target.updated = Date.now();
+      this.persistSessions();
+    };
     try {
       const result = await answer({
         app: this.app,
@@ -258,19 +427,24 @@ export default class Agent extends Plugin {
         signal,
         onUpdate: (update) => {
           if (generation !== this.generation) return;
-          this.working = update.working;
+          this.streamText = update.text || "";
+          this.working = update.working || null;
           this.pendingActions = update.actions;
           this.panel.refresh();
         },
       });
       if (generation !== this.generation || result.stopped) return;
-      this.messages.push({ role: "assistant", text: result.text, actions: result.actions, ms: result.ms });
+      const target = this.sessions.find((item) => item.id === sessionId);
+      if (target) target.result = { ms: result.ms, tokens: result.tokens || 0 };
+      finish({ role: "assistant", text: result.text, actions: result.actions, ms: result.ms });
     } catch (error) {
       if (generation !== this.generation) return;
-      this.messages.push({ role: "assistant", text: error.message || String(error), error: true });
+      finish({ role: "assistant", text: error.message || String(error), error: true });
     } finally {
       if (generation === this.generation) {
         this.working = null;
+        this.workingId = null;
+        this.streamText = "";
         this.pendingActions = [];
         this.panel.refresh();
       }
@@ -519,6 +693,73 @@ export default class Agent extends Plugin {
     this.tab.refresh();
     if (refreshPanel) this.panel.refresh();
   }
+}
+
+function blankSession() {
+  return {
+    id: `chat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+    title: "New chat",
+    messages: [],
+    draft: "",
+    context: null,
+    open: true,
+    updated: Date.now(),
+  };
+}
+
+function loadSessions(text) {
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = null;
+  }
+  const sessions = Array.isArray(data?.sessions) ? data.sessions.map(sanitizeSession).filter(Boolean) : [];
+  return { sessions, activeId: data?.activeId ? String(data.activeId) : "" };
+}
+
+function sanitizeSession(session) {
+  if (!session || typeof session !== "object" || !session.id) return null;
+  return {
+    id: String(session.id),
+    title: String(session.title || "New chat"),
+    messages: Array.isArray(session.messages) ? session.messages : [],
+    draft: String(session.draft || ""),
+    context: session.context && session.context.text ? session.context : null,
+    result:
+      session.result && Number.isFinite(Number(session.result.ms))
+        ? { ms: Number(session.result.ms), tokens: Number(session.result.tokens) || 0 }
+        : null,
+    open: session.open !== false,
+    updated: Number(session.updated) || 0,
+  };
+}
+
+function trimSessions(sessions) {
+  if (sessions.length <= 40) return sessions;
+  const open = sessions.filter((session) => session.open);
+  const closed = sessions
+    .filter((session) => !session.open)
+    .sort((a, b) => b.updated - a.updated);
+  const room = Math.max(0, 40 - open.length);
+  const kept = new Set([...open, ...closed.slice(0, room)].map((session) => session.id));
+  return sessions.filter((session) => kept.has(session.id));
+}
+
+function chatTitle(text, attachment) {
+  const line = String(text || attachment?.label || "New chat").trim().split("\n")[0];
+  if (!line) return "New chat";
+  return line.length > 48 ? `${line.slice(0, 48)}…` : line;
+}
+
+function sessionStamp(updated) {
+  if (!updated) return "";
+  return new Date(updated).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function flatten(lists) {

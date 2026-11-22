@@ -26,11 +26,14 @@ Keep `notia.d.ts` beside `main.js` for editor completions. Notia also writes a c
 | Model | A listed model, a custom name, or **Load models** to ask the server |
 | Embedding provider | Same as chat, a different provider, or None |
 | Embedding model | Used when you index the vault |
+| Refresh the index | Off, or keep the index current about two seconds after a note is saved, renamed, or deleted |
 | Include the open note | Sends the open note and the selection with the question |
 | Search the vault | Attaches a few matching passages |
 | Allow edits | The agent may create and edit notes |
 
 **Index the vault** embeds notes so a question can find a passage that does not share its words. Until then, search is by keywords. Indexing again skips notes that have not changed. The index is stored in this plugin's `index/` folder.
+
+**Refresh the index** does that on its own: after a note is created, saved, renamed, or deleted, one pass runs about two seconds later and embeds only the notes that changed. Changing the embedding provider or model runs a pass too, because stored vectors only match the model that made them. The panel shows whether search is semantic or keyword only, and says while the index is updating.
 
 Ollama needs no key. Pull a chat model and an embedding model, for example `nomic-embed-text`, then load models and index.
 

@@ -16,6 +16,10 @@ import {
 
 const { Plugin, Notice, ui } = api;
 
+/** How long the vault has to stay quiet before an index pass, in ms. */
+const INDEX_DELAY_MS = 2000;
+const EMBEDDING_KEYS = ["embeddingProvider", "embeddingModel", "embeddingBase", "embeddingKey"];
+
 export default class Agent extends Plugin {
   async onload() {
     const saved = await this.loadData();
@@ -33,6 +37,8 @@ export default class Agent extends Plugin {
     this.generation = 0;
     this.signal = { stopped: false };
     this.indexing = null;
+    this.indexTimer = null;
+    this.indexPassOwed = false;
     this.activity = "";
 
     this.panel = this.addPanel({
@@ -95,14 +101,43 @@ export default class Agent extends Plugin {
       callback: () => this.startIndex(),
     });
 
+    for (const event of ["modify", "rename", "delete"]) {
+      this.registerEvent(this.app.vault.on(event, () => this.scheduleIndex()));
+    }
+    if (this.settings.indexRefresh === "change" && embedEndpoint(this.settings)) {
+      this.startIndex({ auto: true });
+    }
+
     if (typeof api.requestUrl !== "function") {
       new Notice("This Notia is too old for the agent. Update Notia and try again.");
     }
   }
 
+  onunload() {
+    if (this.indexTimer != null) clearTimeout(this.indexTimer);
+    this.indexTimer = null;
+  }
+
+  /** One index pass ~2s after the vault settled, while the setting is on. */
+  scheduleIndex() {
+    if (this.settings.indexRefresh !== "change") return;
+    if (this.indexTimer != null) clearTimeout(this.indexTimer);
+    this.indexTimer = setTimeout(() => {
+      this.indexTimer = null;
+      // A pass already running would ignore this one, so owe it instead.
+      if (this.indexing) {
+        this.indexPassOwed = true;
+        return;
+      }
+      this.startIndex({ auto: true });
+    }, INDEX_DELAY_MS);
+  }
+
   renderChat() {
     const session = this.chat();
-    const body = this.historyOpen ? this.renderHistory() : this.renderMessages(session);
+    const body = this.historyOpen
+      ? flatten([this.renderHistory(), this.renderMessages(session)])
+      : this.renderMessages(session);
     return ui.dock(body, this.renderComposer(session), this.renderTabBar());
   }
 
@@ -129,7 +164,7 @@ export default class Agent extends Plugin {
   renderHistory() {
     const items = this.sessions
       .filter((session) => session.messages.length)
-      .sort((a, b) => a.updated - b.updated);
+      .sort((a, b) => b.updated - a.updated);
     if (!items.length) return [ui.empty("No earlier chats.")];
     return [
       ui.heading("History"),
@@ -168,7 +203,7 @@ export default class Agent extends Plugin {
     const seconds = Math.max(1, Math.round(ms / 1000));
     const parts = [
       ui.icon(live ? "circle" : "check", { muted: live }),
-      ui.text(live ? "Working" : "Done", { small: true }),
+      ui.text(live ? this.working || "Working" : "Done", { small: true }),
       ui.text(`${seconds}s`, { small: true, muted: true }),
     ];
     if (done && session.result.tokens > 0 && ms > 0) {
@@ -191,6 +226,7 @@ export default class Agent extends Plugin {
     const model = chat.model || chat.provider.label;
     return [
       this.renderStatus(session),
+      this.settings.searchVault ? ui.text(this.searchStatus(), { small: true, muted: true }) : null,
       ui.composer([
         this.renderAttachments(session),
         this.renderMention(session),
@@ -247,7 +283,7 @@ export default class Agent extends Plugin {
       const blocks = [ui.text("You", { small: true, muted: true, bold: true })];
       if (message.attachment) blocks.push(ui.chip(message.attachment.label));
       for (const note of message.notes || []) blocks.push(ui.chip(note.label));
-      if (message.text) blocks.push(ui.markdown(quote(message.text)));
+      if (message.text) blocks.push(ui.markdown(message.text));
       return blocks;
     }
     const blocks = [ui.text("Agent", { small: true, muted: true, bold: true })];
@@ -484,7 +520,12 @@ export default class Agent extends Plugin {
     const notes = session.notes || [];
     if (!question && !attachment && !notes.length) return;
     if (this.workingId) {
-      if (this.workingId !== session.id) new Notice("The other chat is still replying.");
+      new Notice(
+        this.workingId === session.id
+          ? "This chat is still replying. Stop it to send again."
+          : "The other chat is still replying.",
+      );
+      this.panel.refresh();
       return;
     }
     const problem = chatError(this.settings);
@@ -696,6 +737,13 @@ export default class Agent extends Plugin {
           : ui.button("Index the vault", () => this.startIndex(), { icon: "refresh-cw" }),
         { description: "Embeds notes so search can find a passage that does not share the question's words." },
       ),
+      ui.setting(
+        "Refresh the index",
+        ui.toggle(this.settings.indexRefresh === "change", (on) =>
+          this.save({ indexRefresh: on ? "change" : "off" }),
+        ),
+        { description: "Embeds changed notes about two seconds after a note is saved, renamed, or deleted." },
+      ),
       ui.setting("Remove index", ui.button("Remove", () => this.removeIndex())),
       ui.heading("Agent"),
       ui.setting(
@@ -754,12 +802,28 @@ export default class Agent extends Plugin {
     }
   }
 
-  async startIndex() {
+  /** What search can do now: the index only counts when its model matches. */
+  searchStatus() {
+    if (this.indexing) return "Updating index…";
+    const endpoint = embedEndpoint(this.settings);
+    let manifest = null;
+    try {
+      manifest = JSON.parse(this.readFile("index/manifest.json") || "null");
+    } catch {
+      manifest = null;
+    }
+    if (!endpoint || !manifest || !(Number(manifest.parts) > 0)) return "Keyword search only";
+    if (manifest.model !== endpoint.model || manifest.provider !== endpoint.id) return "Keyword search only";
+    return `Semantic search · ${manifest.model}`;
+  }
+
+  async startIndex({ auto = false } = {}) {
     if (this.indexing) return;
     const token = {};
     this.indexing = token;
     this.activity = "Indexing…";
     this.tab.refresh();
+    this.panel.refresh();
     try {
       await indexVault({
         app: this.app,
@@ -773,30 +837,50 @@ export default class Agent extends Plugin {
         },
         stopped: () => this.indexing !== token,
       });
-      if (this.indexing === token) new Notice("The vault index is updated.");
+      if (this.indexing === token && !auto) new Notice("The vault index is updated.");
     } catch (error) {
       if (this.indexing === token) this.activity = error.message || String(error);
     } finally {
-      if (this.indexing === token) this.indexing = null;
+      const finished = this.indexing === token;
+      if (finished) this.indexing = null;
       this.tab.refresh();
+      this.panel.refresh();
+      if (this.indexPassOwed) {
+        this.indexPassOwed = false;
+        if (finished && this.settings.indexRefresh === "change") this.startIndex({ auto: true });
+      }
     }
   }
 
   stopIndex() {
     this.indexing = null;
+    this.indexPassOwed = false;
     this.activity = "Indexing stopped.";
     this.tab.refresh();
+    this.panel.refresh();
   }
 
   removeIndex() {
     clearIndex((name, text) => this.writeFile(name, text));
     this.activity = "Index removed.";
     this.tab.refresh();
+    this.panel.refresh();
   }
 
   save(patch, refreshPanel) {
     Object.assign(this.settings, patch);
     this.saveData(this.settings);
+    if (patch.indexRefresh === "off") {
+      if (this.indexTimer != null) clearTimeout(this.indexTimer);
+      this.indexTimer = null;
+      this.indexPassOwed = false;
+    } else if (
+      EMBEDDING_KEYS.some((key) => key in patch) ||
+      (this.settings.embeddingProvider === "same" && ["chatProvider", "chatBase", "chatKey"].some((key) => key in patch))
+    ) {
+      // A different model means the stored vectors no longer match.
+      this.scheduleIndex();
+    }
     this.tab.refresh();
     if (refreshPanel) this.panel.refresh();
   }
@@ -925,13 +1009,6 @@ function mergeNames(previous, next) {
     names.push(name);
   }
   return names;
-}
-
-function quote(text) {
-  return String(text)
-    .split("\n")
-    .map((line) => `> ${line}`)
-    .join("\n");
 }
 
 function worked(message) {

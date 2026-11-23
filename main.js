@@ -1,7 +1,14 @@
 import api from "notia";
 
 import { answer } from "./lib/agent.js";
-import { listModels } from "./lib/provider.js";
+import {
+  anchorKey,
+  positionAfter,
+  statusPreview,
+  suggestionMatches,
+  writeContinuation,
+} from "./lib/inline.js";
+import { complete, listModels } from "./lib/provider.js";
 import { clearIndex, indexSummary, indexVault } from "./lib/search.js";
 import {
   PROVIDERS,
@@ -10,6 +17,8 @@ import {
   defaults,
   embedEndpoint,
   embeddingProviderChoices,
+  inlineDebounceMs,
+  inlineMaxChars,
   modelChoices,
   providerChoices,
 } from "./lib/settings.js";
@@ -40,6 +49,11 @@ export default class Agent extends Plugin {
     this.indexTimer = null;
     this.indexPassOwed = false;
     this.activity = "";
+    this.suggestion = null;
+    this.flight = null;
+    this.inlineTimer = null;
+    this.inlineStatusText = "";
+    this.contextSignatureValue = "";
 
     this.panel = this.addPanel({
       id: "chat",
@@ -66,9 +80,11 @@ export default class Agent extends Plugin {
     });
 
     this.addRibbonIcon("bot", "Agent", () => this.panel.show());
-    setInterval(() => {
+    this.inlineStatus = this.addStatusBarItem();
+    this.registerInterval(setInterval(() => {
       if (this.workingId) this.panel.refresh();
-    }, 1000);
+      this.followEditor();
+    }, 1000));
     this.addCommand({
       id: "show",
       name: "Show the agent",
@@ -95,6 +111,20 @@ export default class Agent extends Plugin {
       },
     });
     this.addCommand({
+      id: "continue-writing",
+      name: "Continue writing",
+      icon: "sparkles",
+      hotkey: "alt-\\",
+      editorCallback: (editor, note) => this.continueWriting(editor, note),
+    });
+    this.addCommand({
+      id: "dismiss-suggestion",
+      name: "Dismiss the writing suggestion",
+      icon: "x",
+      hotkey: "alt-shift-\\",
+      callback: () => this.dismissSuggestion(),
+    });
+    this.addCommand({
       id: "index",
       name: "Index notes for the agent",
       icon: "refresh-cw",
@@ -104,6 +134,9 @@ export default class Agent extends Plugin {
     for (const event of ["modify", "rename", "delete"]) {
       this.registerEvent(this.app.vault.on(event, () => this.scheduleIndex()));
     }
+    this.registerEvent(this.app.workspace.on("editor-change", () => this.onEditorChange()));
+    this.registerEvent(this.app.workspace.on("file-open", () => this.onFileOpen()));
+    this.contextSignatureValue = this.contextSignature();
     if (this.settings.indexRefresh === "change" && embedEndpoint(this.settings)) {
       this.startIndex({ auto: true });
     }
@@ -116,6 +149,173 @@ export default class Agent extends Plugin {
   onunload() {
     if (this.indexTimer != null) clearTimeout(this.indexTimer);
     this.indexTimer = null;
+    this.clearInlineTimer();
+    this.cancelInline();
+  }
+
+  // shortcut: status-bar preview instead of ghost text, until the editor can show uncommitted inline text
+  setInlineStatus(text) {
+    const next = String(text || "");
+    if (this.inlineStatusText === next) return;
+    this.inlineStatusText = next;
+    this.inlineStatus?.setText(next);
+  }
+
+  clearInlineTimer() {
+    if (this.inlineTimer != null) clearTimeout(this.inlineTimer);
+    this.inlineTimer = null;
+  }
+
+  cancelInline() {
+    if (this.flight) this.flight.signal.stopped = true;
+    this.flight = null;
+  }
+
+  dismissSuggestion() {
+    this.clearInlineTimer();
+    this.cancelInline();
+    this.suggestion = null;
+    this.setInlineStatus("");
+  }
+
+  onFileOpen() {
+    this.dismissSuggestion();
+    this.syncContextChips();
+  }
+
+  onEditorChange() {
+    if (this.flight) this.flight.signal.stopped = true;
+    if (this.suggestion || this.flight) {
+      this.suggestion = null;
+      this.setInlineStatus("");
+    }
+    this.syncContextChips();
+    this.scheduleInline();
+  }
+
+  // shortcut: poll the caret to drop a stale suggestion, until workspace emits cursor moves
+  followEditor() {
+    if (this.flight || this.suggestion) {
+      const snapshot = takeSnapshot(this.app.workspace.getActiveEditor(), this.app.workspace.getActiveNote());
+      if (this.flight && (!snapshot || this.flight.key !== anchorKey(snapshot))) {
+        this.flight.signal.stopped = true;
+        this.setInlineStatus("");
+      }
+      if (this.suggestion && !suggestionMatches(this.suggestion, snapshot)) {
+        this.suggestion = null;
+        if (!this.flight || this.flight.signal.stopped) this.setInlineStatus("");
+      }
+    }
+    this.syncContextChips();
+  }
+
+  scheduleInline() {
+    this.clearInlineTimer();
+    if (this.settings.inlineAssist === false || this.workingId) return;
+    const note = this.app.workspace.getActiveNote();
+    if (!note || note.mode === "preview") return;
+    this.inlineTimer = setTimeout(() => {
+      this.inlineTimer = null;
+      this.prepareSuggestion(this.app.workspace.getActiveEditor(), this.app.workspace.getActiveNote(), {
+        insert: false,
+      });
+    }, inlineDebounceMs(this.settings));
+  }
+
+  continueWriting(editor, note) {
+    const snapshot = takeSnapshot(editor, note);
+    if (this.suggestion && suggestionMatches(this.suggestion, snapshot)) {
+      this.applySuggestion(editor, this.suggestion);
+      return;
+    }
+    this.prepareSuggestion(editor, note, { insert: true });
+  }
+
+  async prepareSuggestion(editor, note, { insert }) {
+    const snapshot = takeSnapshot(editor, note);
+    if (!snapshot) return;
+    if (!insert && (snapshot.mode === "preview" || snapshot.selection || snapshot.before.trim().length < 8)) return;
+    const problem = chatError(this.settings);
+    if (problem) {
+      if (insert) new Notice(`${problem} Settings → AI agent.`);
+      return;
+    }
+    const key = anchorKey(snapshot);
+    if (this.flight && !this.flight.signal.stopped && this.flight.key === key) {
+      if (insert) {
+        this.flight.insert = true;
+        this.setInlineStatus("Writing…");
+      }
+      return;
+    }
+    if (this.flight) this.flight.signal.stopped = true;
+    const signal = { stopped: false };
+    const flight = { key, insert, signal };
+    this.flight = flight;
+    this.setInlineStatus(insert ? "Writing…" : "Suggesting…");
+    try {
+      const text = await writeContinuation({
+        complete,
+        settings: this.settings,
+        before: snapshot.before,
+        after: snapshot.after,
+        selection: snapshot.selection,
+        maxChars: inlineMaxChars(this.settings),
+        signal,
+        onDelta: (preview) => {
+          if (signal.stopped || this.flight !== flight) return;
+          const label = flight.insert ? "Writing…" : "Alt+\\";
+          this.setInlineStatus(`${label} ${statusPreview(preview)}`);
+        },
+      });
+      if (signal.stopped || this.flight !== flight) return;
+      const pending = {
+        path: snapshot.path,
+        line: snapshot.line,
+        ch: snapshot.ch,
+        selection: snapshot.selection,
+        beforeTail: snapshot.before.slice(-80),
+        text,
+      };
+      const current = takeSnapshot(this.app.workspace.getActiveEditor(), this.app.workspace.getActiveNote());
+      if (!text || !suggestionMatches(pending, current)) {
+        this.setInlineStatus("");
+        if (flight.insert) {
+          new Notice(text ? "The note changed before the suggestion was ready." : "The model returned nothing to insert.");
+        }
+        return;
+      }
+      if (flight.insert) {
+        this.applySuggestion(this.app.workspace.getActiveEditor(), pending);
+        return;
+      }
+      this.suggestion = pending;
+      this.setInlineStatus(`Alt+\\ ${statusPreview(text)}`);
+    } catch (error) {
+      if (signal.stopped || this.flight !== flight) return;
+      this.setInlineStatus("");
+      if (flight.insert) new Notice(error.message || String(error));
+    } finally {
+      if (this.flight === flight) this.flight = null;
+    }
+  }
+
+  applySuggestion(editor, pending) {
+    this.suggestion = null;
+    this.setInlineStatus("");
+    try {
+      if (pending.selection) {
+        editor.transaction({ replaceSelection: pending.text });
+      } else {
+        const from = { line: pending.line, ch: pending.ch };
+        editor.transaction({
+          changes: [{ from, text: pending.text }],
+          selection: { from: positionAfter(from, pending.text) },
+        });
+      }
+    } catch (error) {
+      new Notice(error.message || String(error));
+    }
   }
 
   /** One index pass ~2s after the vault settled, while the setting is on. */
@@ -399,7 +599,7 @@ export default class Agent extends Plugin {
   }
 
   renderAttachments(session) {
-    const chips = [];
+    const chips = this.contextChips(session).map((chip) => ui.chip(chip.label, chip.dismiss));
     if (session.context) {
       chips.push(
         ui.chip(session.context.label, () => {
@@ -418,6 +618,64 @@ export default class Agent extends Plugin {
       );
     }
     return chips.length ? ui.row(chips, { wrap: true }) : null;
+  }
+
+  /** Open note and live selection, which the next message includes unless dismissed. */
+  contextChips(session) {
+    if (this.settings.includeNote === false) return [];
+    const note = this.app.workspace.getActiveNote();
+    const editor = this.app.workspace.getActiveEditor();
+    if (!note || !editor) return [];
+    const chips = [];
+    const file = String(note.path).split("/").pop();
+    const pinnedNote = (session.notes || []).some((item) => item.path === note.path);
+    if (!pinnedNote && session.omitNote !== note.path) {
+      chips.push({
+        label: `Open · ${file}`,
+        dismiss: () => {
+          session.omitNote = note.path;
+          this.persistSessions();
+          this.syncContextChips();
+        },
+      });
+    }
+    let selected = "";
+    try {
+      selected = editor.somethingSelected() ? editor.getSelection().trim() : "";
+    } catch {
+      selected = "";
+    }
+    const pinned = String(session.context?.text || "").trim();
+    if (selected && selected !== pinned && session.omitNote !== note.path && session.omitSelection !== selected) {
+      chips.push({
+        label: `Selection · ${selectionChipLabel(editor, note)}`,
+        dismiss: () => {
+          session.omitSelection = selected;
+          this.persistSessions();
+          this.syncContextChips();
+        },
+      });
+    }
+    return chips;
+  }
+
+  contextSignature() {
+    try {
+      const note = this.app.workspace.getActiveNote();
+      const editor = this.app.workspace.getActiveEditor();
+      const selected = editor?.somethingSelected?.() ? editor.getSelection().trim() : "";
+      const labels = this.contextChips(this.chat()).map((chip) => chip.label).join("|");
+      return `${note?.path || ""}\n${selected.length}\n${selected.slice(0, 24)}\n${labels}`;
+    } catch {
+      return "";
+    }
+  }
+
+  syncContextChips() {
+    const next = this.contextSignature();
+    if (next === this.contextSignatureValue) return;
+    this.contextSignatureValue = next;
+    this.panel?.refresh();
   }
 
   /** Notes matching the `[[` link being typed at the end of the draft. */
@@ -493,6 +751,7 @@ export default class Agent extends Plugin {
   }
 
   stop() {
+    if (!this.workingId) return;
     this.generation += 1;
     this.signal.stopped = true;
     const actions = this.pendingActions;
@@ -518,6 +777,8 @@ export default class Agent extends Plugin {
     const question = String(text ?? "").trim();
     const attachment = session.context;
     const notes = session.notes || [];
+    const omitNote = session.omitNote || "";
+    const omitSelection = session.omitSelection || "";
     if (!question && !attachment && !notes.length) return;
     if (this.workingId) {
       new Notice(
@@ -535,6 +796,8 @@ export default class Agent extends Plugin {
     session.draft = "";
     session.context = null;
     session.notes = [];
+    session.omitNote = "";
+    session.omitSelection = "";
     session.updated = Date.now();
     session.messages.push({ role: "user", text: question, attachment, notes });
     session.result = null;
@@ -571,6 +834,8 @@ export default class Agent extends Plugin {
         question,
         attachment,
         notes,
+        omitNote,
+        omitSelection,
         read: (name) => this.readFile(name),
         signal,
         onUpdate: (update) => {
@@ -610,7 +875,7 @@ export default class Agent extends Plugin {
         : [];
     const embed = embedEndpoint(this.settings);
     const rows = [
-      ui.text("The agent sits in the right sidebar. A sparkles button above the note opens it."),
+      ui.text("The agent sits in the right sidebar. A sparkles button above the note opens it. Alt+\\ continues the note."),
       ui.heading("Chat"),
       ui.setting(
         "Provider",
@@ -761,6 +1026,33 @@ export default class Agent extends Plugin {
         ui.toggle(this.settings.allowEdits !== false, (allowEdits) => this.save({ allowEdits })),
         { description: "The agent may create notes and change existing ones. It cannot delete notes." },
       ),
+      ui.heading("Writing"),
+      ui.setting(
+        "Inline assistance",
+        ui.toggle(this.settings.inlineAssist !== false, (inlineAssist) => this.save({ inlineAssist })),
+        {
+          description:
+            "After you pause, a short continuation is prepared. Alt+\\ inserts it. The note stays as it is until then. Alt+Shift+\\ dismisses it.",
+        },
+      ),
+      ui.setting(
+        "Pause",
+        ui.numberInput(inlineDebounceMs(this.settings), (inlineDebounce) => this.save({ inlineDebounce }), {
+          min: 200,
+          max: 5000,
+          step: 100,
+        }),
+        { description: "How long the note stays still before that request, in milliseconds." },
+      ),
+      ui.setting(
+        "Suggestion length",
+        ui.numberInput(inlineMaxChars(this.settings), (inlineMaxChars) => this.save({ inlineMaxChars }), {
+          min: 40,
+          max: 2000,
+          step: 20,
+        }),
+        { description: "The most characters a continuation may add." },
+      ),
       ui.heading("Instructions"),
       ui.textArea(this.settings.system, (system) => this.save({ system }), { id: "system", rows: 8 }),
     );
@@ -868,6 +1160,9 @@ export default class Agent extends Plugin {
   }
 
   save(patch, refreshPanel) {
+    if ("inlineDebounce" in patch) patch.inlineDebounce = inlineDebounceMs({ inlineDebounce: patch.inlineDebounce });
+    if ("inlineMaxChars" in patch) patch.inlineMaxChars = inlineMaxChars({ inlineMaxChars: patch.inlineMaxChars });
+    if (patch.inlineAssist === false) this.dismissSuggestion();
     Object.assign(this.settings, patch);
     this.saveData(this.settings);
     if (patch.indexRefresh === "off") {
@@ -882,6 +1177,7 @@ export default class Agent extends Plugin {
       this.scheduleIndex();
     }
     this.tab.refresh();
+    if ("includeNote" in patch) this.syncContextChips();
     if (refreshPanel) this.panel.refresh();
   }
 }
@@ -894,6 +1190,8 @@ function blankSession() {
     draft: "",
     context: null,
     notes: [],
+    omitNote: "",
+    omitSelection: "",
     open: true,
     updated: Date.now(),
   };
@@ -918,6 +1216,8 @@ function sanitizeSession(session) {
     messages: Array.isArray(session.messages) ? session.messages : [],
     draft: String(session.draft || ""),
     context: session.context && session.context.text ? session.context : null,
+    omitNote: session.omitNote ? String(session.omitNote) : "",
+    omitSelection: session.omitSelection ? String(session.omitSelection) : "",
     notes: Array.isArray(session.notes)
       ? session.notes
           .filter((note) => note && note.path && note.text)
@@ -985,6 +1285,42 @@ function sessionStamp(updated) {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function takeSnapshot(editor, note) {
+  if (!editor || !note) return null;
+  try {
+    const selected = editor.somethingSelected() ? editor.getSelection() : "";
+    const from = editor.getCursor("from");
+    const head = editor.getCursor("head");
+    const to = editor.getCursor("to");
+    const at = selected ? from : head;
+    const afterFrom = selected ? to : head;
+    const last = editor.lastLine();
+    return {
+      path: note.path,
+      mode: note.mode,
+      line: at.line,
+      ch: at.ch,
+      selection: selected,
+      before: editor.getRange({ line: 0, ch: 0 }, at),
+      after: editor.getRange(afterFrom, { line: last, ch: editor.getLine(last).length }),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function selectionChipLabel(editor, note) {
+  const file = String(note.path).split("/").pop();
+  const from = editor.getCursor("from");
+  const to = editor.getCursor("to");
+  let end = to.line;
+  if (to.ch === 0 && end > from.line) end -= 1;
+  const start = from.line + 1;
+  const last = end + 1;
+  const lines = start === last ? String(start) : `${start}-${last}`;
+  return `${file} (${lines})`;
 }
 
 function flatten(lists) {
